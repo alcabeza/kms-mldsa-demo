@@ -1,0 +1,816 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Self-contained demo of AWS KMS post-quantum signatures (ML-DSA, FIPS 204).
+  Creates an ML-DSA KMS key, an ECDSA P-256 baseline key, a small VPC, and an EC2 instance
+  (Amazon Linux 2023, no inbound ports, SSM access) that installs JDK 25 + Maven, builds the
+  embedded Java demo, runs it and records results. The verification and benchmark scripts are
+  embedded too (/opt/kms-mldsa-demo/scripts). Delete the stack to remove everything.
+
+Parameters:
+  MlDsaKeySpec:
+    Type: String
+    Default: ML_DSA_65
+    AllowedValues: [ML_DSA_44, ML_DSA_65, ML_DSA_87]
+    Description: ML-DSA parameter set (NIST level 2 / 3 / 5). Cannot be changed after creation.
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large, m6i.large, c6i.large]
+    Description: x86_64 instance type used to build and run the demo.
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 x86_64 AMI (resolved at deploy time).
+  Iterations:
+    Type: Number
+    Default: 200
+    MinValue: 20
+    MaxValue: 5000
+    Description: Measured calls per operation in the latency benchmark.
+  Warmup:
+    Type: Number
+    Default: 20
+    MinValue: 0
+    MaxValue: 500
+    Description: Warm-up calls per operation (not measured).
+  KeyDeletionWindowDays:
+    Type: Number
+    Default: 7
+    MinValue: 7
+    MaxValue: 30
+    Description: Waiting period before the KMS keys are deleted when the stack is deleted.
+
+Resources:
+  # ---------------------------------------------------------------- KMS keys
+  MlDsaKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub "${AWS::StackName} - ML-DSA signing key (post-quantum demo)"
+      KeySpec: !Ref MlDsaKeySpec
+      KeyUsage: SIGN_VERIFY
+      PendingWindowInDays: !Ref KeyDeletionWindowDays
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+      Tags:
+        - Key: purpose
+          Value: pq-signature-demo
+
+  MlDsaKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}-mldsa"
+      TargetKeyId: !Ref MlDsaKey
+
+  EcdsaKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub "${AWS::StackName} - ECDSA P-256 baseline key (classical, quantum-vulnerable)"
+      KeySpec: ECC_NIST_P256
+      KeyUsage: SIGN_VERIFY
+      PendingWindowInDays: !Ref KeyDeletionWindowDays
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+      Tags:
+        - Key: purpose
+          Value: pq-signature-demo-baseline
+
+  EcdsaKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}-ecdsa-p256"
+      TargetKeyId: !Ref EcdsaKey
+
+  # ---------------------------------------------------------------- IAM
+  DemoPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least-privilege access for the KMS ML-DSA demo (sign, verify, read public key).
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SignVerifyDemoKeysOnly
+            Effect: Allow
+            Action:
+              - kms:Sign
+              - kms:Verify
+              - kms:GetPublicKey
+              - kms:DescribeKey
+            Resource:
+              - !GetAtt MlDsaKey.Arn
+              - !GetAtt EcdsaKey.Arn
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref DemoPolicy
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: cfn-init-and-signal
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:SignalResource
+                Resource: !Ref AWS::StackId
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # ---------------------------------------------------------------- Network (outbound only)
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.77.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.77.0.0/25
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: No inbound access. Outbound HTTPS/HTTP only (package downloads, KMS, SSM).
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # ---------------------------------------------------------------- EC2
+  DemoLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+          HttpPutResponseHopLimit: 1
+
+  DemoInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - DefaultRoute
+      - SubnetRouteTableAssociation
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT30M
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            /opt/kms-mldsa-demo/demo.env:
+              mode: "000644"
+              owner: root
+              group: root
+              content: !Sub |
+                AWS_REGION=${AWS::Region}
+                AWS_DEFAULT_REGION=${AWS::Region}
+                ML_DSA_KEY_ID=${MlDsaKey}
+                ECDSA_KEY_ID=${EcdsaKey}
+                ITERATIONS=${Iterations}
+                WARMUP=${Warmup}
+            /opt/kms-mldsa-demo/run-demo.sh:
+              mode: "000755"
+              owner: root
+              group: root
+              content: |
+                #!/bin/bash
+                # Runs the demo on the instance. Re-runnable: sudo /opt/kms-mldsa-demo/run-demo.sh
+                set -a; . /opt/kms-mldsa-demo/demo.env; set +a
+                export JAVA_HOME=/usr/lib/jvm/java-25-amazon-corretto
+                export PATH=$JAVA_HOME/bin:/opt/apache-maven/bin:$PATH
+                cd /opt/kms-mldsa-demo
+                java -version 2>&1 | head -1
+                mvn -q -B exec:java
+            /opt/kms-mldsa-demo/pom.xml:
+              mode: "000644"
+              owner: root
+              group: root
+              content: |
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+                  <modelVersion>4.0.0</modelVersion>
+
+                  <groupId>demo</groupId>
+                  <artifactId>kms-mldsa-demo</artifactId>
+                  <version>1.0.0</version>
+                  <packaging>jar</packaging>
+                  <name>AWS KMS ML-DSA demo</name>
+
+                  <properties>
+                    <!-- JDK 24+ is required: native ML-DSA (FIPS 204) in java.security, JEP 497. JDK 25 (LTS) recommended. -->
+                    <maven.compiler.release>24</maven.compiler.release>
+                    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+                    <!-- Needs a release that knows ML_DSA_SHAKE_256 and EXTERNAL_MU (mid-2025 or later). -->
+                    <aws.sdk.version>2.35.11</aws.sdk.version>
+                    <bc.version>1.80</bc.version>
+                  </properties>
+
+                  <dependencyManagement>
+                    <dependencies>
+                      <dependency>
+                        <groupId>software.amazon.awssdk</groupId>
+                        <artifactId>bom</artifactId>
+                        <version>${aws.sdk.version}</version>
+                        <type>pom</type>
+                        <scope>import</scope>
+                      </dependency>
+                    </dependencies>
+                  </dependencyManagement>
+
+                  <dependencies>
+                    <dependency>
+                      <groupId>software.amazon.awssdk</groupId>
+                      <artifactId>kms</artifactId>
+                    </dependency>
+                    <!-- Only used to compute external mu (SHAKE256) and to parse the SubjectPublicKeyInfo. -->
+                    <dependency>
+                      <groupId>org.bouncycastle</groupId>
+                      <artifactId>bcprov-jdk18on</artifactId>
+                      <version>${bc.version}</version>
+                    </dependency>
+                  </dependencies>
+
+                  <build>
+                    <plugins>
+                      <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.5.0</version>
+                        <configuration>
+                          <mainClass>demo.KmsMlDsaDemo</mainClass>
+                        </configuration>
+                      </plugin>
+                    </plugins>
+                  </build>
+                </project>
+            /opt/kms-mldsa-demo/src/main/java/demo/KmsMlDsaDemo.java:
+              mode: "000644"
+              owner: root
+              group: root
+              content: |
+                package demo;
+
+                import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
+                import org.bouncycastle.crypto.digests.SHAKEDigest;
+                import software.amazon.awssdk.core.SdkBytes;
+                import software.amazon.awssdk.services.kms.KmsClient;
+                import software.amazon.awssdk.services.kms.model.KeyMetadata;
+                import software.amazon.awssdk.services.kms.model.KmsInvalidSignatureException;
+                import software.amazon.awssdk.services.kms.model.MessageType;
+                import software.amazon.awssdk.services.kms.model.SigningAlgorithmSpec;
+
+                import java.nio.charset.StandardCharsets;
+                import java.nio.file.Files;
+                import java.nio.file.Path;
+                import java.security.GeneralSecurityException;
+                import java.security.KeyFactory;
+                import java.security.PublicKey;
+                import java.security.SecureRandom;
+                import java.security.Signature;
+                import java.security.SignatureException;
+                import java.security.spec.X509EncodedKeySpec;
+                import java.util.ArrayList;
+                import java.util.Arrays;
+                import java.util.List;
+
+                /**
+                 * Demo: post-quantum digital signatures with AWS KMS (ML-DSA, FIPS 204).
+                 *
+                 * 1. Checks the KMS key (key spec, signing algorithm).
+                 * 2. Signs with ML_DSA_SHAKE_256 (RAW), verifies in KMS and locally with the JDK (offline).
+                 * 3. Checks that a tampered message is rejected.
+                 * 4. Signs with EXTERNAL_MU (mu computed client side) and verifies the result.
+                 * 5. Measures latency (KMS Sign, KMS Verify, local Verify): ML-DSA vs ECDSA P-256 baseline.
+                 *
+                 * Env vars: ML_DSA_KEY_ID (required), ECDSA_KEY_ID (optional baseline),
+                 *           ITERATIONS (default 200), WARMUP (default 20). Region/credentials: default AWS chain.
+                 */
+                public final class KmsMlDsaDemo {
+
+                    private interface Op { void run() throws Exception; }
+
+                    private record Target(String label, String keyId, SigningAlgorithmSpec alg,
+                                          String keyFactoryAlg, String sigAlg, PublicKey pub, byte[] spki) {}
+
+                    private static int failures = 0;
+
+                    public static void main(String[] args) throws Exception {
+                        String mlKeyId = requireEnv("ML_DSA_KEY_ID");
+                        String ecKeyId = System.getenv("ECDSA_KEY_ID");
+                        int iterations = intEnv("ITERATIONS", 200);
+                        int warmup = intEnv("WARMUP", 20);
+
+                        byte[] message = new byte[256];
+                        new SecureRandom().nextBytes(message);
+
+                        try (KmsClient kms = KmsClient.create()) {
+                            System.out.println("== 1. Keys ==");
+                            Target ml = load(kms, "ML-DSA", mlKeyId, SigningAlgorithmSpec.ML_DSA_SHAKE_256, "ML-DSA", "ML-DSA");
+                            Target ec = (ecKeyId == null || ecKeyId.isBlank()) ? null
+                                    : load(kms, "ECDSA-P256", ecKeyId, SigningAlgorithmSpec.ECDSA_SHA_256, "EC", "SHA256withECDSA");
+
+                            System.out.println("\n== 2. Sign (RAW) / verify in KMS and offline with the JDK ==");
+                            byte[] sig = kmsSign(kms, ml, message);
+                            System.out.printf("signature: %d bytes, public key (SPKI): %d bytes%n", sig.length, ml.spki().length);
+                            check("KMS Verify accepts the signature", kmsVerify(kms, ml, message, sig));
+                            check("Local (JDK) verify accepts the signature", localVerify(ml, message, sig));
+
+                            System.out.println("\n== 3. Tampered message must be rejected ==");
+                            byte[] tampered = message.clone();
+                            tampered[0] ^= 0x01;
+                            check("KMS Verify rejects tampered message", !kmsVerify(kms, ml, tampered, sig));
+                            check("Local verify rejects tampered message", !localVerify(ml, tampered, sig));
+
+                            System.out.println("\n== 4. EXTERNAL_MU (mu computed outside KMS) ==");
+                            byte[] mu = externalMu(ml.spki(), message);
+                            byte[] sigMu = kms.sign(r -> r.keyId(ml.keyId())
+                                            .message(SdkBytes.fromByteArray(mu))
+                                            .messageType(MessageType.EXTERNAL_MU)
+                                            .signingAlgorithm(ml.alg()))
+                                    .signature().asByteArray();
+                            check("EXTERNAL_MU signature verifies locally against the original message",
+                                    localVerify(ml, message, sigMu));
+                            System.out.println("info: EXTERNAL_MU signature identical to RAW signature: " + Arrays.equals(sig, sigMu));
+
+                            if (ec != null) {
+                                byte[] ecSig = kmsSign(kms, ec, message);
+                                System.out.printf("%nSize comparison: ML-DSA signature %d B vs ECDSA %d B; public key %d B vs %d B%n",
+                                        sig.length, ecSig.length, ml.spki().length, ec.spki().length);
+                            }
+
+                            System.out.printf("%n== 5. Latency (n=%d, warmup=%d, message=%d bytes, ms) ==%n",
+                                    iterations, warmup, message.length);
+                            List<String> csv = new ArrayList<>();
+                            csv.add("operation,iteration,ms");
+                            System.out.printf("%-26s %8s %8s %8s %8s %8s%n", "operation", "mean", "p50", "p95", "p99", "max");
+
+                            benchTarget(kms, ml, message, warmup, iterations, csv);
+                            if (ec != null) {
+                                benchTarget(kms, ec, message, warmup, iterations, csv);
+                            }
+                            Path out = Path.of("results.csv");
+                            Files.write(out, csv, StandardCharsets.UTF_8);
+                            System.out.println("\nRaw samples written to " + out.toAbsolutePath());
+                        }
+
+                        System.out.println(failures == 0 ? "\nALL CHECKS PASSED" : "\n" + failures + " CHECK(S) FAILED");
+                        if (failures != 0) {
+                            System.exit(1);
+                        }
+                    }
+
+                    // ---------- KMS / crypto helpers ----------
+
+                    private static Target load(KmsClient kms, String label, String keyId, SigningAlgorithmSpec alg,
+                                               String keyFactoryAlg, String sigAlg) throws GeneralSecurityException {
+                        KeyMetadata md = kms.describeKey(r -> r.keyId(keyId)).keyMetadata();
+                        System.out.printf("%s: keySpec=%s, usage=%s, signingAlgorithms=%s%n",
+                                label, md.keySpecAsString(), md.keyUsageAsString(), md.signingAlgorithmsAsStrings());
+                        if (!md.signingAlgorithmsAsStrings().contains(alg.toString())) {
+                            throw new IllegalStateException(label + ": key does not support " + alg);
+                        }
+                        byte[] spki = kms.getPublicKey(r -> r.keyId(keyId)).publicKey().asByteArray();
+                        PublicKey pub = KeyFactory.getInstance(keyFactoryAlg).generatePublic(new X509EncodedKeySpec(spki));
+                        return new Target(label, keyId, alg, keyFactoryAlg, sigAlg, pub, spki);
+                    }
+
+                    private static byte[] kmsSign(KmsClient kms, Target t, byte[] msg) {
+                        return kms.sign(r -> r.keyId(t.keyId())
+                                        .message(SdkBytes.fromByteArray(msg))
+                                        .messageType(MessageType.RAW)
+                                        .signingAlgorithm(t.alg()))
+                                .signature().asByteArray();
+                    }
+
+                    private static boolean kmsVerify(KmsClient kms, Target t, byte[] msg, byte[] sig) {
+                        try {
+                            return kms.verify(r -> r.keyId(t.keyId())
+                                            .message(SdkBytes.fromByteArray(msg))
+                                            .messageType(MessageType.RAW)
+                                            .signingAlgorithm(t.alg())
+                                            .signature(SdkBytes.fromByteArray(sig)))
+                                    .signatureValid();
+                        } catch (KmsInvalidSignatureException e) {
+                            return false; // KMS signals an invalid signature with an exception
+                        }
+                    }
+
+                    private static boolean localVerify(Target t, byte[] msg, byte[] sig) throws GeneralSecurityException {
+                        Signature v = Signature.getInstance(t.sigAlg());
+                        v.initVerify(t.pub());
+                        v.update(msg);
+                        try {
+                            return v.verify(sig);
+                        } catch (SignatureException e) {
+                            return false;
+                        }
+                    }
+
+                    /**
+                     * External mu, FIPS 204 section 6.2 (pure ML-DSA, empty context):
+                     * tr = SHAKE256(pk, 64); mu = SHAKE256(tr || 0x00 || 0x00 || M, 64).
+                     */
+                    private static byte[] externalMu(byte[] spki, byte[] msg) {
+                        byte[] rawPk = SubjectPublicKeyInfo.getInstance(spki).getPublicKeyData().getBytes();
+                        byte[] tr = shake256(rawPk, 64);
+                        SHAKEDigest d = new SHAKEDigest(256);
+                        d.update(tr, 0, tr.length);
+                        d.update((byte) 0x00); // domain separator: pure ML-DSA
+                        d.update((byte) 0x00); // context length = 0
+                        d.update(msg, 0, msg.length);
+                        byte[] mu = new byte[64];
+                        d.doFinal(mu, 0, mu.length);
+                        return mu;
+                    }
+
+                    private static byte[] shake256(byte[] in, int outLen) {
+                        SHAKEDigest d = new SHAKEDigest(256);
+                        d.update(in, 0, in.length);
+                        byte[] out = new byte[outLen];
+                        d.doFinal(out, 0, outLen);
+                        return out;
+                    }
+
+                    // ---------- benchmark ----------
+
+                    private static void benchTarget(KmsClient kms, Target t, byte[] msg, int warmup, int n, List<String> csv)
+                            throws Exception {
+                        byte[] sig = kmsSign(kms, t, msg);
+                        bench(t.label() + " KMS Sign", warmup, n, () -> kmsSign(kms, t, msg), csv);
+                        bench(t.label() + " KMS Verify", warmup, n, () -> kmsVerify(kms, t, msg, sig), csv);
+                        bench(t.label() + " local Verify", warmup, n, () -> localVerify(t, msg, sig), csv);
+                    }
+
+                    private static void bench(String label, int warmup, int n, Op op, List<String> csv) throws Exception {
+                        for (int i = 0; i < warmup; i++) {
+                            op.run();
+                        }
+                        double[] ms = new double[n];
+                        for (int i = 0; i < n; i++) {
+                            long t0 = System.nanoTime();
+                            op.run();
+                            ms[i] = (System.nanoTime() - t0) / 1_000_000.0;
+                            csv.add(label + "," + i + "," + String.format(java.util.Locale.ROOT, "%.3f", ms[i]));
+                        }
+                        double[] sorted = ms.clone();
+                        Arrays.sort(sorted);
+                        double mean = Arrays.stream(ms).average().orElse(Double.NaN);
+                        System.out.printf(java.util.Locale.ROOT, "%-26s %8.2f %8.2f %8.2f %8.2f %8.2f%n",
+                                label, mean, pct(sorted, 50), pct(sorted, 95), pct(sorted, 99), sorted[n - 1]);
+                    }
+
+                    /** Nearest-rank percentile on a sorted array. */
+                    private static double pct(double[] sorted, double p) {
+                        int idx = (int) Math.ceil(p / 100.0 * sorted.length) - 1;
+                        return sorted[Math.max(0, Math.min(sorted.length - 1, idx))];
+                    }
+
+                    // ---------- misc ----------
+
+                    private static void check(String name, boolean ok) {
+                        System.out.println((ok ? "[PASS] " : "[FAIL] ") + name);
+                        if (!ok) {
+                            failures++;
+                        }
+                    }
+
+                    private static String requireEnv(String name) {
+                        String v = System.getenv(name);
+                        if (v == null || v.isBlank()) {
+                            throw new IllegalStateException("Missing environment variable " + name);
+                        }
+                        return v;
+                    }
+
+                    private static int intEnv(String name, int def) {
+                        String v = System.getenv(name);
+                        return (v == null || v.isBlank()) ? def : Integer.parseInt(v.trim());
+                    }
+                }
+            /opt/kms-mldsa-demo/scripts.tgz:
+              encoding: base64
+              mode: "000644"
+              owner: root
+              group: root
+              content: |
+                H4sIAAAAAAAC/+1de3fbtpLv3/oUuKxyLTWiXrGdxo5y17WVxvXzWEra3jTrQ0u0zVoiVZKy4ybe
+                z76/GQAkSFF+pG57d494ji2KHAyAwWAwmAfUbNmXbuidXtueH8XOaFSPzr965KuJ6/nKCn/iyn22
+                Vp41V/Uz+bz17Fnz+Vei+dVfcE3R6xDVh0EQ3wZ31/v/o9fX/2hMo7Bx4vkN178UJ050XvpaNFvC
+                Fu+YL0R87sT454ruZlswk/gDVyhucWIv8IUXiUEwnozc2BWVcOqLg30uoaFrwq2f1fFVOL7o9fZE
+                5EYRClbrqEtwpahylhHxtvvRi4F86K6JpugIPxCnjjeahqjoygl9zz+LBICDK3dYrYkWQNDaketE
+                sQh8VwPXS6XIjYU9Lb0XVrniDXFbtYTt/gasH8Tnz8L96A5ENB0Gwu7KBlnlpoV//2WVSlvdvYPj
+                re2jjlX+pO/X7EYwiRsX48gej4aRYw/dcXBjlX7YeLdx/OZgr6sLZB6gFJF75J00fr0cN351Lh27
+                vWI7Y+f3wLcHQRi6cUxo9jbedfc1iuSLqtSZOINz1x47l64PWG7S7sH3SfNwD8hLBxUFZ7km1vEI
+                Zd72ukdbG/0NXc78Xlh2Grnh0IkdVX7rYL97vLdxtNOVVEm/zq95iBFB0dLhRq/Xaa6L1xvbu/T5
+                48bRfqdZmjhRVKmKT4LflysV+hRPRataXRfu4DwQ1nt69EGUW9a6uCnR4HIBRoQC9JkrQI9UgffC
+                9jGgn9pr9o2FUf/nPxWQkFe5zViJrRgrNwtY6TOHlR49DGvkDmiqMGJ6r1F1OkAjOh0GOseAMgRm
+                09jxwaWXQN2yxKvG0L1s+NPRSLRf/bNFsBqjsFp1sa2nJRUau7FDIyUq23tbvct21Sr1D3a6+xin
+                ymAajoQdCXssngn7J3H4ti/O43iy1mi0Vl/U2yvLdfXZwNx2I+I1rxEHF64vfikJYb8RSz/ZzlVk
+                u4O2rWuyGcCO45GNVgX+MFoTq80ltDVpNxrhjYdyfLONeCOseRjXRJlbjnl4eyOpmE3lGkQto1qi
+                lHeqB0kh+7BO0slHd4jlhCXJJGQvg5PY8Xx3aOF1ZiC1MLO9IbiCOmM+qor4euLOvKCHVeH8rl9M
+                Rs7AHbs+6HoJ7nVOvJEXX9uY/C4o5I4iF9USX89rlbCS4cWEvPQw5lM/dCEPnJORa5VOvdLmwVZ3
+                dqwDkfKQfSWWnnwikh6TaL1ZEvclr9Hj3OiSYKWaLYhga7nZUnPBoHCL1onQPYUkGYrKm37/UAAO
+                YhjilyZdARi6exbEgmEZu6i4HydgfGDgsmpwQ9Fw40EjiOzQJeHvysrPQnci7N/E0gbLV7Hr+dOP
+                SzOwJuS77lFv+2D/eHurY7Wb7WfWDHiOeQ561F6zAsHl9GDKns2DotWI6z486vb7Px/vb+x1Z9qX
+                JTRGGJ0mUSFib+xiWECPEXWC1zbzWXQeXAl7Ivb7h71rf3AeBr73O0hn25fOaJpDTON27Uaz02Nz
+                FAwuqPlAY0cmnkro/jb1QtydBqHoeWfvlqu5jj+wsLCwsKEAg10PubeppGvXxXdQw8D5v01dEneV
+                wSiYDqExeHFN0AoliEtrYnDq80PJIEyrFDLp3uY2T5PkhQBvx9OIRaz4LM5dB6QiJhNiQOMABt+2
+                SIv5hlayb6qKPgaCU/yPzqlzAEVv1tcFwOR8LgCzFEqAuZEzoM6+pxlrlc3lODOT3qKTPBUFFlho
+                LV4UR6jNhJczSlZaBG7l8IuxB23MPxMYBnc8ia/1rCpoSEK7ZMJgAdPUXpqBT5qtQUBilGN5Rd1P
+                2ln8HvWgJbKqLur67u327hav9m+Pup/3AzF24sE5848Tnk1Jrn7uh5CwJ87g4vNmMB0NoTHGwBcF
+                o0t3pn1Jb7TM3Sf1EsqncMMQSCdOHLvgYgz51CRkOm2hLD56qxLWe8asp6aTno33bSKtI57iqI9C
+                qo1XESv6CbENvqIFmJ6fYH5FcehMtIafGabboKgimiOGKpjh3E25Q6CJPHbCC8zVCSgA4oB9jTLg
+                XlI0kirnFsMgZDYhUexhacPugzYF/xIxlbZPRZa2hjB5Vhf9IBhh4fR8zfEf0f6Mvs70Ii19YDL/
+                D+9IcMwDxb4COxna39wiSX54JyXJktVeWUpEyQ9bO6K9IiqbaiNQTekLXYjKmBJFQRsDZWkYFicZ
+                daIQuLirzJ2nwdQf6tVGkSbZhzDs+NI3ifK14CqWn2KAPB9SySIteXv/+zWxQbwehx6v21AmzoNh
+                vV63BI/aEIwsTlxMF5c3jYp2a2LiYSGgJ6F3do5NHfQfVLP37uBtn8ifNL6T7UdxO6FJ02DwEOzx
+                8HErT6EIRb/4NAcZMU0+ObHHLagNvM8Se7TPWjJHb0+PngkhntXTkZRPzNHby41eDoJlytw2JQKh
+                eHALcM3QYHZUeV3ElJZDqBq+8WNPbO5uZ5peARApDXO4ep1llFrwZ8qjMb7rDjHyJ9ciGoTeBLzR
+                pF0RWiGXZlJU06WCvhUJn9wLYyov18UWNphAOHKxGl6FHoSiT/UZigDJ41MaNd6LkrEDskJuTLHb
+                nwTj+scxVKZw0Bg7aiY06G1jZxztjbYih6qo0+N1MQxAerVCaoNAo3yakXfl01RSJX0wH2aKFizC
+                pGSU1MxLII02Z2oz+wJti8wZ05i3BGnl82ESNdqoSZPJnONEw0uiIUb5+Kj7PTRlsbd7vNXbON7p
+                /gylGUYi48t2v3u00QdQjzbTe28PFeWEgP7Z0Wuo9d/ly45VXPVnMAfsNsMORHnb5iko9G4OODIk
+                SMZ16ELBAiOUL7G0AMpUiAqACCnTOqNrrkDXnHojua5lxhn2wjM3bgxGqNWNCniE32SaZr5mU5nH
+                rJ1Z6ObAWPerTvMPDyV6NhQNslg26uN2A0QOIi8OwutGFJzGmKduQ1qcSCWIhhdkqAFNnbErlr4B
+                i4eZrXsiEn8T9dzWgCZ7D1J/Z68Hgk5cfwi1/BrUvPJHgTOkWZqRU3fDCytpN+RTRAY/ahzaxFJr
+                fs+C8KxxAuk2uIaMjkdu42QwCYNL+9fhRetbDOi9uscjkozad4xuk9HNa24yfPcANrhrVUksOQfp
+                EaTCdBSbqrc25RWq3Ru7u2LzTXdzp8fmsu7WUqZE0geuhcgU0to7U0ryoMGFd8JbkeuKtCazTUPZ
+                o9Rge1ubEjgSRc3iduRhtMTI1ZSphmVEfspK4kb1QXSZlZrpc6FXjUq5cjUQ9ki8nIehyrpIVDUa
+                Lde+AnRksFGSvTIOLs1VUDSf/Stv9OFu01Ytv0oU79MyEut5XWwGvk9fL2FUYlvgAPtroPGcUSRX
+                QLmGSntaBIsPJle9/CkV52v2jKUqdM/IVn9TlzIDIqMO8dSwhMZB7FJnY3RdWqbrNBn5QbuhRD6N
+                U84o9e1dRimrDGA5oJ/YuEHPLfEPGCrgJlIDqRYD+QoT5SYd3SNtFoMKQ9VKmxODmktCDkwtvDP6
+                EVpBRiGpDNGuG1LZHpAuEsIaRkQGzW0blonwWmyAHWw7mMYTLF+x+zFOtU+lQm5vSRUSLcUWcWiH
+                wSg1KST2XHpqDqK4CsILtJNKm8rk7QUsVZ9hZ0jZpjeFrTkEM0lrJzWAlT62vku+5O9sXJdmHfK6
+                4Anp90pgWfw68agojVJi3N7v9SFIWBEQmwd7h7vdfpeURpq/TaU8FoBu72tgzEmuXXlzKlG1qsu3
+                WI38anF9qW+2rd1u5KzBujUKrmnWP6Yb+A7/b7v1PO//XV5tLS/8v3+j/7dd4P8lpW1v14Z+L1I+
+                oZV5GpH0FK+PDvYybl/pC77d6zuf/QAEyTy0A390jbk+cCexthT7DdU2Er8RmRGo2vgq4L2duHCv
+                o/p8z7F0E//1nuEvcdPeZ18muAPYldYLwdb5/VOHBSW8J9DsjO0bNcZc/W/xz/b3Dmn5G1/E0D6w
+                JyMZzDbApXCMNp6Sg23vEA6T7k/b/YU3t4QBZQBlryK1gbYyxDhKG1gXR5ud8r+y7twmq3GkM0iN
+                7f777dQuwX34x2W+E9hn0+MbVn4+aZPEJc1h4pHKaRiMxSwLVbk7yhyRW+klJol+0/HJxgQHcAwP
+                l1s31uib0iPoTvfRnDYZqdBIC1SlHITSjXRTEx2pxI6oY8gSHsSvBZy17ohkC2SEdkIeR/g8hoLs
+                fkyfOaMzjAL8XjDSc6EO+/BREjdtS6gy+AL/H4Bxs0yKITHH0KW9wYlrAxpEwH/ytFpl3OjdhibT
+                0o57vad8wfX3+NID3ho+30bOmUs3Pbiz3NoBzKeeT9/3HB9vwg9LWfJKL8t7UT7aBOe4hv6mGIQ7
+                sYYNq2zbjstEI8vkOraK8RTjJdUw3WvqIa0KZy671FzsWKgNMOBzAwAXsu0wvAtSvHz5UtZEfE3M
+                RwXgqvwfUVZkFB9Mm5tqqqKGUOCp+S37XrmXGaqWDGCCWu4ksQuh9rF/tLf9/f4xXMTbr3/O2vpS
+                vEx9kQEsqv6txCnrlxWo2pgOXFvXp3V1OK8mHl6RABV2UuJSveQvqhZJZ66GZAvW9sJqiA3hzsJq
+                i2E9c303dIhCUiKxRlDxXazgQi4s1BTToa/RHKjaknpVK9QwczM23/b6MOEfFbZjADUtGKMeWWIo
+                eELM1JMyuWVgv8/cKpxVpGpgr7MxOkOz4/NxNDtzlExiMz0JJauMGW0l4kg3LJKYaLpLVILghDME
+                7WKPIx1MGXV7MTmgEG1cqxZYuZAgpalR51JRBk8BP2YHgbmOWGLpv9WDyvLy59WVz98+r5aX9GLT
+                e7Ox0z1ur6xmfPG89ohDBLCtkmLkklVkpkIGovrMlYqq625uHu9v9/rHhyiPquR71MT1lKIxAl8K
+                RC+RLRG1Y88/Bo2OR7w9ny9ypZSFuEUBLW6l+2IgVpelEWIawmCC9e+V1GMa4/qJZFTiHRqIAp4Z
+                Q6Ol6W6R5+EEphCjZPqao4DE0caPeKRG1E5HVHJMTrgT5yEWAeLti0Q1Fc/LaCWhUxfTkubbzzx6
+                oIMN1ZPNbZoGkaaBIq0LLPhHKznZyAZsI0sBgSkOoRmKJbFU1XN8REYwm4hUHhNMweym5oqDHWzz
+                AWyfXEOsRZoA1QLJlrykxpzF55asBq3hKtSYyY3FXzNqaYuySCONNDes75wRbTVyY6sGVmlWKqKH
+                hwjysR9O3ULqqb3QwU4BpeQ7zQqKMKR8TaYnI29wqyg8ZJAdhrijndkGfe/GaVke1sq9uA7SnJnK
+                5CJB3BCJrSQwQMx20qwv6epN1tXfI3EiKJoNDkLmt4YmXCODAHzLoucWUZkXinB6t5u61Bx5l5Fu
+                kDlZ7+UuByyDSJdgHnBmJbONZpveGCug2D/oQ8cXY+krx7ZaelbRZhrXEaJ7aCzJVzvyxqTOljKy
+                goeqaCSUCd+DX2EwAPtvub7nDpey7hBUsbaLKnaoBo/WUwIyVuF5AFY46FArKrIjzjXc/eIkJKdI
+                KLtB3eWt+yTAKFyr/hCfEmuGQcwhHraKzzIYNjsyj91b8AX6cqSq78na5/X8LmBFBSvrY+z6w0mA
+                NlqlLnbX86zyM7b3Uv8+xnSKBYQxnX0CN0J9dyYT41HW3t49JHO7Vs7jAaJopP+F9fC+jPIsssIr
+                Nyf0QVd1SCRBqZj/3cOaSI3vNdHfxO2neHAT4X63x+5XCtzHM+cmMkV+MUpLtjXrUPsBrnnJRZBW
+                oJI7x5mWjQy91Y+Wc3emNZCLRnrJogInWTYE8r6l5rh6pAHe+ouN9oaxb6t7uHvw8153v09rTKHd
+                vhj6zUZPtUAFx1V6C7v9f5r9/5l9Aj/1OcXW2YkJ8nGTwO6w/y8/X23n7f+t1dWF/f9vtP8jYUDs
+                QSkhjdaY3BM3hElyzFpJYu7P5IXdw+Q/j+MY5Ojtfq+zYkQOdVaaTRU9hNs7UQDJj+SwgIgZBm60
+                xkixHT6CihnCrU0NRkc9hJez+6KStJzU/ZrY+HeNFxLVYuxyD8PgxI0SD0iyGFVoEVMrqVzFoMkM
+                o3PnAhkfV9gkcFzbGhccBJSPdiocKGxXuhDoIiuBeno09WUVvFgknWNycJg/tFaqnTTXGrdDKq81
+                tTOT39b1OF1G5uZc9QV65iECXjlfTkQOhdVGHCSg4jXHruM3JivNxuTFCv5ewIP/kUZcBBMy+6C5
+                NQ6ZiwObBjmasJ6AXqFMjWvARfioH/mGUECTE3oR+iyOnCux2XvHsJFcyMRZgEwXtmjA8lzncdwP
+                oK6vCd1t7fNB9BI1lVhzqDIByNMNJ1GFtAjKKoCWT9qEw5SrccRRSnNAIFK6Si2OUOm5x1oaZbog
+                XKfGUZIxsg+mZ+fY8RDjSHy/TaHZRay90uuYwnzOEZhqk0UM+kFIZuURBWH//0425AkKMPpcs5/h
+                iTFX8Tz9hrfNJt6ryYt38o6e4/Hh0cF3XS4i79bsNj2WHECP5Z3ykMXjidF9kkMIVKE8FxBXPH3y
+                85Pxk2H/yZsne096/66SE2t8MfRCSn6xFFNZRa4KsDBQaAjTX8Fj9Eq8qsSum+BoKHatx/DOVNkv
+                USrd4qAzq9xTKt0soBSaRQmw1UyTbonCLqpIBgVXUvgsNvC/nVywho1A1Mh4VIJvxXOkjysipyG8
+                Sp8RDnMhlj457/ePPnTKrRvR3d/6BJtUZf+o02lWP7EoQcBvw7FupIKoHjnv8b8CsKetaqNd/XAj
+                bpZUK2hXF4mXZDeRcpOmsUxQIulDVsUatwDz3YkGEMDo3StYXV5RMhwWGsgfAZmFvxeYnx+xgSeM
+                1HDo4NkGwxn6lNpdUv68UwTtsVCYDOLKpAbzWhXd6VBbJ41Ws/nN/hH8hOif9zL5LrynT9WzVtXr
+                tOT9K7zxOvtHiUsEPf4gkorm0Im28Nk/NUZJQb7UNtZ6Um+fioJ/v/gWSNTYP6pxR1aaVXnzYkXf
+                vMANEwF0L+UHH+ujuSYaPJC4NVu0VU1B4OJ8nKTSByWU/oVJpNLLex+/uqIRyaI17SU2JNPr/pP+
+                v6t6o6a1jTWGmk0irRQmkNLY/S7ul0LK1ciQPdmccmpG0K9pJUjb+iV5LHrbGSKoFt4hDA+vC2XW
+                V4wFoTwTAt4py09kcmJdIYViDQOYqBiRQGYkR3AktUjbo+qMktQ5Bm7XU71sQvpanodTRgZoRo2T
+                4JWsXia4bVJ7KMvlSQJGVWb9h9lq1tierlYQRsPrB3v3j0lZLlegx8D3bKm6rKqOmvyDBh6ZRQJL
+                iXhV3AR26kORPd7rSfc8CUtT2pBkKbe+gehr3iwVoQBbyIWC0sx3e7ciqpTbdrlVvSc2OWSGlo0I
+                WvluLZWM5U+y9TdiHCVFTF18thCKcDupCL6+tM2Bx5yeTlhfXxfOCaenaZVxaMAldVX6UHapQrKk
+                I0oJ9cJ+ewb9cSK4jAwFT4KUBiOPcEInC6FHrKc6PympQxl8jXKRWVe9mud37BjSPUJIe4e5/P6s
+                nt9TMDxxsQoGShOpcpIggTjc6L8xX5KIWMvqIWtlAoL6tsOCoMnM7WWZm94krC0biL6Q7lP2GvIt
+                hQaMKW1vTui1dIBVxGBoQHBoeUYLTb9YIlE/5Q18gMiFgunP/o718DUSdaKqfAu4jIlCu52yV+eM
+                T3nuQpIvmrMszgaZG7ACVc4FTCuTT2lvhTpVZ+lSJEXskryT0Uvq5e2GzIJ+0PZDRzQps+BaogZh
+                J8muW1itPZmkSntFNn5WKO4/RVTVrUuQBRekkc3pRZLEahSggU8Spk/gXfIDYUbQF9fITswEXYKM
+                LIzdLVlmttscqsYJoSuFVJHJskmEk6QzeS3jfIwT0m+jKXsNTqecbZqNctJLVrJj9mJ9B/mU4S1F
+                KFL0mUxJflqyYTFZ4hsCoqmj+uGLp21KJ8tK9jzSdZnYlBUesAOQggxHjTe4RXCQW0puirNGAAjU
+                iLRKmBIwbgEFfyiCETkqaoVMHC92ezUST57j79uZP1qeUry+KNLmS3AOjmjPb8OagVeHL1ZKB4e8
+                yGQoMYcCSQZZDVKlpTcw/wCb+O/LzQ9Pn5JSeXVOe4/t171OEpgUTLLRdMFE7bJ0dJvaWtiva5Rb
+                Gkw6Emap3Op0gone9pSfmetcQeP0zsoYxPolZ2sIkfjZZS5K5vWMq103vIiG0n1TURutPCoufu/x
+                kt20yhxfQJXRJ+rjjxcr8uOFDL/5SJgxaO+50IeOBFynMTQeoRBPPRXsdYhVQK8BWYrkGHSFzWaJ
+                OSpWmrCocO/BlnhcwxovGfILx5h2nx3LUrmP95ifMr1R60D3Y49TkxM+qw2x3msryPbNkpKAskll
+                jrYxshdzY/gkM1oEPEPlHD1X68XmQ5gnaIKSpU+9h6WO3+eneovYpNXU/76lTmS+Zyc8POxCck53
+                U97Iivg5sxI9pxt+zhLyghIAaRC0WdCSt0mgg2kPtdSAjFeabGciTlRdKBMi6wNFyEJ+G++5YzbF
+                JJkwhOTFCgMR7xYiMd7PRZKeRTReyWUwufzAUBtCbpVko0vhdFQZ3J90FPjSd9hy7LNh4eRVs5qx
+                E3yEScBpnCg/nWGYEQknhdzkTA1EbV0D3f/BGh7IG5akliaP6qVVDuXHWMoXV36EJDjShdtg5m2E
+                T4cwT0tX/JoyPrssFjf2t4QycK/zTpD2TOynDxA7xNGNyNDz3ZgSp6BqventkfVJRGNShc6cSaL6
+                nwAGy0ganBexbVoHp9WNIK4IJ95AhcpNryrDM4lkTCVpJC1SSOq6jteU0b6WaDSfDPtjLbea1PLS
+                qEboviF0tWSDBSbM+eaWbTJ+/Fmuv3v4/xA805o5/7G9OP/x7/T/fUc+CeILKLvQYHnt0wG/iokr
+                r7cPezjEarkqfSQ4yQmMSvH9dPrDZbumwrtqbDWqkdj3owhJmMHpKS9dMhaLApjEK9qmrlSl24cj
+                o9cMf2EBh4qC62u9xTb9kTKCGXkS5Gs6YquYXP451UHb8rgyZB5u7vABXJ3xNYUa4fQRI0/GndpX
+                1Ixnt7bqa4nY4bTLSMsf1QZ+RS1k5FypDFzqvCQI7LjoyKCR50SvHlgzEy6X8ETiStJYRodgb3Th
+                TR52WmbJIArWtvTbml2c3tTdf5f4rXBf6LdKTKgohP/Q7diga7pRUNQM1MEJEa30hAh+mRgjc0dE
+                SNfNHUlO8ttW9/XG292+kfgsW2MUrN7cWHejSwYIwGpAASHvDLSZWDXyUW3sIhcsH0xYkH/V29k+
+                LMy/Ks1Pv/pPyb8inmOs3Algpc8cVnqUNONeqVXgdgoQfImjMSKcJPRqjY0J2PjoJCt1gOY6nS8E
+                +/FTdcwQmaOwlNbMkwV8ihl8YLKWuZ/+sosS/PkAPBxf4UaZ7K9D8420C0A8c1AFWqWCZon7k9R6
+                47BQDjfOHRda5BxMDt9TpaFjUFHTlpFoVXzu193HAOV8Dxm/g4rE+x0t1BGxqaqbzBmugM/J4ygT
+                pkiStcFCk+qXFQCTUQGFYNN7ecqHVU4lVT6y3uoxnvfND/UDdixE7/8lbxC92eks8bkquN0eLmmI
+                d+SLtGZy0mYPZcz3kAj/3njQIfuR75p9z7ijh+RLGfPimIZQYGmAKgl5LLHUaJFIu9cwMgMrAe95
+                9TrI1mS9EFbrfJYcDy61VtYL3BgoHT37GGwNPyHnDCkXXCYlhcLBsbU+9c6mcgcow3zn5eVoqj0w
+                4W0mva04Y8I4cmMmrU2Ny3pxXiM7qVEBVnlSJTjElQYpmTxEX21joE70DrGPpZu3vY3vu/JRfwPH
+                GqTZbTq3UYNTMhGdVCYXh+XlKmWUHe/C30qx5rCg7PCX1rNWGwlAKeTqSgqJQ9RfpJAvVrKQyO9J
+                IJdX288TyPbKCwX5TQqRVtmkdzJDklhbAViZoGsZDKxy8DwKMtLMzPl+laSbmUjfefBJulNCnJKe
+                VEzQWzPzkow8oC1OypsLYdQq60mq5dGbm6KXpOYB4Wx2XuFbs4OMu/TlM+POpLVsyhqNM0Tp7vdp
+                0hrN0yQzLSpKQiPwhEeSft2nUDZzTTHSI8gduHUpVSfJw8kkqql8D5UQVAEgRLbO/yIjTXECWHQm
+                059KRRlg6RjMSSdSpYsSivgk7cKkIqbRXUlgqUAzA7cfnNvlnensrjR6nynFBJJuDnfIluiNzf7b
+                jV2e/7OpXwpPYfJXWpCnSyoujPnSy2Vz0czQgDL9Zybz5z5FFKcZLcgetTSvuw9dAxKWyy4ApeIU
+                tD+VbeZmoXlnD8hDe1gWWmp8Fc6ADumQcaxJU/Kn3N0JrlfERxAK8H377hlUjUtlbsikhO1nXiFp
+                dZKb+OprjFBZaOTDulSQ9STDQeKvXhWBfOHIZ3D8jcOfV5fuSqPiMd32LwlVgrjL57WQipdLoemr
+                XgpNBD7s/VeZeF+5DRMflZYXfXn2fA1HkTt7hPnttWbJ0WEc+YPZbsOQZriBjh3JviQBEoZKBkB+
+                PXGGifDVlP3lYxPH5X0WQ4qo7szAiZOo00JwinvRQfAMxNDUj/EA4uiyA7kErX9g7kj+k4SP2Yv7
+                MuCnR2bBG70Tu4NP6Nzl6YSYIu2NOdBZnrgLeg5b/FXaRDbl9C6lYpbg6vB/fHjkUpuH2PhRh8A3
+                VPfkyJL0KO8/hstiok197WBBxL9atPlsTa3PLTdfPC9W6E70pPuSETjx/jR9bg7pCbNuy4gOgVXJ
+                sujgqkqLNn8pI0PqB5a9J2mftYsJi9+ZCGN7PP1y6mYw5Enc/QnhXPtQ4vbe/kmkNmvgEHQHfZUH
+                EWTkvfrtEqjTkobaipY/tP4R8N0xJI+gHSHAR54CQNMrk45+mDxOE7GLDwzI70TnnRnwOFsWtKE+
+                lAe6HL79rng7omFmtiNypDNnE2idHxYJhS89bkD0pickxxPobf80qCY+fEuXkFFi+LpjbGyy70cI
+                34D9nQFg+l5drlYzjn7ZspTo7C6WvyJBB1QnJiTEYVzxe1WZauxTbi7NUTfM/mKEZMY7EYPZCIPa
+                SumGI9lLVZcejKQ6Kb3umbWwkK6JMk/L3iNwLCJ+tPeQlRusJcyzT9FE+hUMrCzjaSa9/qAInIzl
+                5gytHMA32evtaj8kolgPu/t4cHywA78LxtswsWs/5sxPcqnhPKBy7/hX0SoaVlvM54T0JDGDBEzG
+                EYXCYLbMLwOgjfWmDJdIQJMAonemSZ5UHYZODws0uiZzsGlsVC3pO5mu1koCVKL87Er5V3dywqIB
+                AHBUIIWJLPjMmDaHTGUKk2gwnk3cMTlZ5IMAuOrw1VDnlTPGrGGKnzWytWabVMYnDWXxIS/vSr7M
+                7+qUPwDylVOOcip6xtkz/6wTzViadTIMhkgpnS6aaobppMgZM/4IKp5fkC6AFjn6UdD4I5Mwu0X9
+                IjrmV95bOy81aWkhiHMbsIeR8XZMVgZ27ppL7n1D0KQhEEKLnNU64h4mNERSca3Jg7rZbISS1TXG
+                IWhl6gh2+ULrrUwuarQorAtCajwHFHrXxM7Q/NxjYCCS4a8DY+3JTbNk2byoYyQtY64Oz+Dxtzk/
+                gvcGH4NTOj+J1lwMHuXjZkommOJQmwyRgJWwnHqamkZoM8sb2nUDSs8/2o0lJtYpmIvSbBXWh7Yv
+                U97Aquy2xWd33bnXup8W+of0UPMcr5xG9HAzbqJ5p8pEatw0mp216c47JOuPbkXvpMwtZipjB3Cv
+                A7PueWSWblahvp82R0oB2hr5LHCdM4fcpyw05LmFNO8VUaQXIUFdqPr/MdSJHfrPXQiLRHgyDnkp
+                Pnc9vKPbWm3jzZCS0A8nXjGW1F6f1XvvmgNpwVSZpXCVdCm5VWvkyLWs5ogTdOn3laDCfdKK2Zrt
+                06/eQriTZx7DPdYRYqE7oEwwI1Ds0fRkFSX6xccFERUm/IBCc+5xWhAlH/W7vX5yllHhKUESPcHh
+                ICCVsbM4D2hxLa7FtbgW1+JaXItrcS2uxbW4FtfiWlyLa3EtrsW1uBbX4lpci2txLa7FtbgW1+Ja
+                XItrcS2uL7/+F2PhfowAoAAA
+          commands:
+            10-extract-scripts:
+              command: >-
+                mkdir -p /opt/kms-mldsa-demo/scripts &&
+                tar -xzf /opt/kms-mldsa-demo/scripts.tgz -C /opt/kms-mldsa-demo/scripts &&
+                chmod 755 /opt/kms-mldsa-demo/scripts/*.sh
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DemoLaunchTemplate
+        Version: !GetAtt DemoLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-demo"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > >(tee /var/log/kms-mldsa-userdata.log | tee /dev/console) 2>&1
+          set -u
+          rc=0
+
+          echo "== setup: JDK 25 + Maven + cfn-bootstrap"
+          dnf -y --releasever=latest install java-25-amazon-corretto-devel aws-cfn-bootstrap tar gzip || rc=1
+          if [ ! -x /usr/lib/jvm/java-25-amazon-corretto/bin/javac ]; then
+            rpm --import https://yum.corretto.aws/corretto.key
+            curl -fsSL -o /etc/yum.repos.d/corretto.repo https://yum.corretto.aws/corretto.repo
+            dnf -y install java-25-amazon-corretto-devel && rc=0 || rc=1
+          fi
+          curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz \
+            | tar -xz -C /opt || rc=1
+          ln -sfn /opt/apache-maven-3.9.9 /opt/apache-maven
+
+          echo "== cfn-init (writes the embedded demo sources)"
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource DemoInstance --region ${AWS::Region} || rc=1
+
+          if [ $rc -eq 0 ]; then
+            echo "== build + run demo (log: /var/log/kms-mldsa-demo.log)"
+            bash -c '. /opt/kms-mldsa-demo/demo.env; export JAVA_HOME=/usr/lib/jvm/java-25-amazon-corretto; export PATH=$JAVA_HOME/bin:/opt/apache-maven/bin:$PATH; cd /opt/kms-mldsa-demo && mvn -q -B compile' || rc=1
+          fi
+          if [ $rc -eq 0 ]; then
+            /opt/kms-mldsa-demo/run-demo.sh 2>&1 | tee /var/log/kms-mldsa-demo.log | tee /dev/console
+            echo "demo exit code: ${!PIPESTATUS[0]}" | tee -a /var/log/kms-mldsa-demo.log
+          fi
+          touch /var/log/kms-mldsa-demo.done
+
+          /opt/aws/bin/cfn-signal -e $rc --stack ${AWS::StackName} --resource DemoInstance --region ${AWS::Region} \
+            --reason "setup rc=$rc (demo results: /var/log/kms-mldsa-demo.log)"
+
+Outputs:
+  InstanceId:
+    Value: !Ref DemoInstance
+  MlDsaKeyId:
+    Description: ML-DSA key ID
+    Value: !Ref MlDsaKey
+  EcdsaKeyId:
+    Description: ECDSA P-256 baseline key ID
+    Value: !Ref EcdsaKey
+  DemoPolicyArn:
+    Description: Policy granting sign/verify/get-public-key on both keys (attach to other identities if needed).
+    Value: !Ref DemoPolicy
+  ScriptsDirectory:
+    Description: Verification, test and benchmark scripts on the instance (01 install, 02 KMS deployment, 03 benchmark, 04 functional tests).
+    Value: /opt/kms-mldsa-demo/scripts
+  ShowResultsCommand:
+    Description: Print the demo results from the instance via SSM Run Command (no SSH needed).
+    Value: !Sub >-
+      aws ssm send-command --region ${AWS::Region} --instance-ids ${DemoInstance}
+      --document-name AWS-RunShellScript --parameters 'commands=["cat /var/log/kms-mldsa-demo.log"]'
+      --query Command.CommandId --output text
+  ConsoleOutputCommand:
+    Description: Alternative - read the demo output from the EC2 console log.
+    Value: !Sub "aws ec2 get-console-output --region ${AWS::Region} --instance-id ${DemoInstance} --latest --output text"
+  SessionCommand:
+    Description: Open a shell on the instance (needs the Session Manager plugin).
+    Value: !Sub "aws ssm start-session --region ${AWS::Region} --target ${DemoInstance}"
