@@ -122,3 +122,11 @@ deleted. Check AWS KMS pricing for asymmetric keys and requests.
 - `src/`, `pom.xml` and `ec2-scripts/` are the sources; `template.yaml` embeds copies of them.
   After editing any of them, run `python3 build-template.py` to regenerate the template.
 - `aws.sdk.version` in `pom.xml` must be recent enough to know `ML_DSA_SHAKE_256` / `EXTERNAL_MU`.
+
+- 📄 Sources:
+▪️NIST FIPS 203: https://lnkd.in/eXQErqSS
+▪️NIST FIPS 204: https://lnkd.in/ep6eTKgE
+▪️AWS PQC: https://lnkd.in/evfw8X8y
+▪️KMS ML-DSA: https://lnkd.in/erN8X2Dk
+▪️KMS Encapsulate: https://lnkd.in/eQXfBXwv
+▪️S3 PQ-TLS: https://lnkd.in/eSfFpGAu
