@@ -123,7 +123,7 @@ deleted. Check AWS KMS pricing for asymmetric keys and requests.
   After editing any of them, run `python3 build-template.py` to regenerate the template.
 - `aws.sdk.version` in `pom.xml` must be recent enough to know `ML_DSA_SHAKE_256` / `EXTERNAL_MU`.
 
-## 📄 Sources:
+## 📄 Sources
 ▪️NIST FIPS 203: https://lnkd.in/eXQErqSS
 ▪️NIST FIPS 204: https://lnkd.in/ep6eTKgE
 ▪️AWS PQC: https://lnkd.in/evfw8X8y
